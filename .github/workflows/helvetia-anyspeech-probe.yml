@@ -1,0 +1,94 @@
+name: Helvetia AnySpeech ARM probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Record runner and toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p results
+          uname -a | tee results/uname.txt
+          sysctl -n machdep.cpu.brand_string | tee results/cpu.txt
+          xcodebuild -version | tee results/xcode.txt
+          xcrun swift --version | tee results/swift.txt
+
+      - name: Fetch fixed public German benchmark clips
+        run: |
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          command -v ffprobe >/dev/null
+          python3 Tools/helvetia-benchmark-fetch.py
+
+      - name: Build and run package tests
+        run: |
+          set -o pipefail
+          xcrun swift test --no-parallel 2>&1 | tee results/swift-test.log
+          xcrun swift build -c release --product hear 2>&1 | tee results/swift-build.log
+
+      - name: Install Parakeet and Sortformer assets
+        run: |
+          set -o pipefail
+          .build/release/hear prepare --backend parakeet --diarize 2>&1 | tee results/parakeet-prepare.log
+
+      - name: Evaluate Parakeet on ten FLEURS German clips
+        run: |
+          set -euo pipefail
+          for audio in benchmark/clip_*.wav; do
+            index="${audio##*_}"
+            index="${index%.wav}"
+            .build/release/hear evaluate "$audio" --backend parakeet --cache-state warm > "results/parakeet_${index}.ndjson"
+          done
+
+      - name: Evaluate two-speaker Sortformer diarization
+        run: |
+          .build/release/hear evaluate benchmark/diarization.wav \
+            --backend parakeet --diarize \
+            --rttm benchmark/diarization.rttm --collar 0.25 \
+            --cache-state warm > results/diarization.ndjson
+
+      - name: Evaluate Apple German recognizer when assets are available
+        id: apple
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          .build/release/hear prepare --backend apple --locale de-DE 2>&1 | tee results/apple-prepare.log
+          for audio in benchmark/clip_*.wav; do
+            index="${audio##*_}"
+            index="${index%.wav}"
+            .build/release/hear evaluate "$audio" --backend apple --locale de-DE --cache-state warm > "results/apple_${index}.ndjson"
+          done
+
+      - name: Score normalized word error rates
+        if: always()
+        run: |
+          if [ -f results/apple-prepare.log ] && [ "${{ steps.apple.outcome }}" != "success" ]; then
+            python3 Tools/helvetia-benchmark-score.py results/apple-prepare.log
+          else
+            python3 Tools/helvetia-benchmark-score.py
+          fi
+          cat summary.json
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: helvetia-anyspeech-arm-probe
+          path: |
+            summary.json
+            benchmark/dataset.json
+            benchmark/references.json
+            benchmark/diarization.rttm
+            benchmark/diarization.wav
+            benchmark/clip_*.wav
+            results/
+          if-no-files-found: error
+          retention-days: 7

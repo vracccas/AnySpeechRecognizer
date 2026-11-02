@@ -1,0 +1,95 @@
+name: Helvetia AnySpeech extended pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pilot:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Record runner and toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p pilot-results
+          uname -a | tee pilot-results/uname.txt
+          sysctl -n machdep.cpu.brand_string | tee pilot-results/cpu.txt
+          xcodebuild -version | tee pilot-results/xcode.txt
+          xcrun swift --version | tee pilot-results/swift.txt
+
+      - name: Build deterministic benchmark corpus
+        run: |
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          python3 Tools/helvetia-pilot-fetch.py
+
+      - name: Build and test exact package code
+        run: |
+          set -o pipefail
+          xcrun swift test --no-parallel 2>&1 | tee pilot-results/swift-test.log
+          xcrun swift build -c release --product hear 2>&1 | tee pilot-results/swift-build.log
+
+      - name: Install Parakeet v3, live and Sortformer assets
+        run: |
+          set -o pipefail
+          .build/release/hear prepare --backend parakeet --live --diarize 2>&1 | tee pilot-results/v3-prepare.log
+
+      - name: Evaluate Parakeet v3 clean, noisy and long-form audio
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > pilot-benchmark/items.tsv
+          import json
+          for item in json.load(open('pilot-benchmark/items.json')):
+              print(f"{item['scenario']}\t{item['index']:03d}\t{item['path']}")
+          PY
+          while IFS=$'\t' read -r scenario index audio; do
+            .build/release/hear evaluate "$audio" --backend parakeet --cache-state warm > "pilot-results/v3_${scenario}_${index}.ndjson"
+          done < pilot-benchmark/items.tsv
+          .build/release/hear evaluate pilot-benchmark/audio/long_000.wav --backend parakeet --live --cache-state warm > pilot-results/v3live_long_000.ndjson
+
+      - name: Evaluate sequential and overlapping diarization
+        run: |
+          .build/release/hear evaluate pilot-benchmark/audio/diarization-sequential.wav \
+            --backend parakeet --diarize \
+            --rttm pilot-benchmark/references/diarization-sequential.rttm --collar 0.25 \
+            --cache-state warm > pilot-results/diarization-sequential.ndjson
+          .build/release/hear evaluate pilot-benchmark/audio/diarization-overlap.wav \
+            --backend parakeet --diarize \
+            --rttm pilot-benchmark/references/diarization-overlap.rttm --collar 0.25 \
+            --cache-state warm > pilot-results/diarization-overlap.ndjson
+
+      - name: Install and evaluate Parakeet Ultra
+        run: |
+          set -euo pipefail
+          .build/release/hear prepare --backend parakeet --version ultra 2>&1 | tee pilot-results/ultra-prepare.log
+          while IFS=$'\t' read -r scenario index audio; do
+            if [ "$scenario" = clean ] || [ "$scenario" = long ]; then
+              .build/release/hear evaluate "$audio" --backend parakeet --version ultra --cache-state warm > "pilot-results/ultra_${scenario}_${index}.ndjson"
+            fi
+          done < pilot-benchmark/items.tsv
+
+      - name: Score normalized word error rates
+        run: |
+          python3 Tools/helvetia-pilot-score.py
+          python3 - <<'PY'
+          import json
+          s=json.load(open('pilot-summary.json'))
+          compact={b:{k:round(v['wer']*100,2) for k,v in s[b].items()} for b in ('v3','v3live','ultra') if s.get(b)}
+          print(json.dumps(compact,indent=2))
+          PY
+
+      - name: Upload complete pilot evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: helvetia-anyspeech-extended-pilot
+          path: |
+            pilot-summary.json
+            pilot-benchmark/
+            pilot-results/
+          if-no-files-found: error
+          retention-days: 7
